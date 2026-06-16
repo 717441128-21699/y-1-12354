@@ -300,7 +300,25 @@ export function manualDispose(
       handlerName || null
     );
 
-    return { disposalNo, itemsCount: items.length, totalQty };
+    for (const item of items) {
+      const cons = db.prepare('SELECT name, code FROM consumables WHERE id = ?').get(item.consumable_id) as any;
+      logOperation({
+        bizType: BizType.DISPOSAL,
+        action: LogAction.SCRAP,
+        title: '人工报废库存',
+        detail: `【${cons?.name || '耗材'}】批次${item.batch_no}，追溯码${item.trace_code}，数量${item.quantity}，原因：${reason}，处置单号：${disposalNo}`,
+        relatedType: 'inventory',
+        relatedId: item.id,
+        operatorId: handlerId,
+        operatorName: handlerName,
+        operatorRole: 'warehouse_manager',
+        oldValue: item.status,
+        newValue: 'scrapped',
+        status: 'scrapped'
+      });
+    }
+
+    return { disposalNo, itemsCount: items.length, totalQty, items };
   });
 
   try {

@@ -3,6 +3,7 @@ import { ConsumptionStatus, RequisitionStatus } from '../types';
 import { consumeInventory } from './cabinet.service';
 import { sendNotification } from '../utils/notification';
 import { daysUntilExpiry } from '../utils/date';
+import { logOperation, BizType, LogAction } from './operation-log.service';
 
 export interface ConsumptionCreateRequest {
   requisitionId?: number;
@@ -143,6 +144,21 @@ export function recordConsumption(request: ConsumptionCreateRequest): {
       relatedType: 'consumption',
       relatedId: result.id,
       recipientRoles: ['warehouse_manager', 'operating_room_nurse']
+    });
+
+    logOperation({
+      bizType: BizType.INVENTORY,
+      action: LogAction.CONSUME,
+      title: '库存消耗',
+      detail: `【${inventory.consumable_name}】批次${inventory.batch_no}，追溯码${request.traceCode}，使用${request.quantityUsed}${inventory.unit}，剩余${result.remaining}${inventory.unit}${request.requisitionId ? `，关联领用单ID:${request.requisitionId}` : ''}${request.patientId ? `，患者ID:${request.patientId}` : ''}${request.surgeryId ? `，手术ID:${request.surgeryId}` : ''}`,
+      relatedType: 'inventory',
+      relatedId: inventory.id,
+      operatorId: request.operatorId,
+      operatorName: operator,
+      operatorRole: 'operating_room_nurse',
+      oldValue: String(inventory.quantity),
+      newValue: String(result.remaining),
+      status: result.remaining === 0 ? 'depleted' : 'normal'
     });
 
     return {
@@ -299,6 +315,21 @@ export function returnUnusedConsumables(
     SET quantity = quantity + ?
     WHERE id = ?
   `).run(returnQuantity, inventory.slot_id);
+
+  logOperation({
+    bizType: BizType.INVENTORY,
+    action: LogAction.RETURN,
+    title: '库存退还',
+    detail: `追溯码${traceCode}，退还${returnQuantity}个，操作员：${operator || '未知'}`,
+    relatedType: 'inventory',
+    relatedId: inventory.id,
+    operatorId,
+    operatorName: operator,
+    operatorRole: 'warehouse_manager',
+    oldValue: String(inventory.quantity),
+    newValue: String((inventory.quantity || 0) + returnQuantity),
+    status: 'normal'
+  });
 
   return { success: true, message: `${returnQuantity}个耗材已退还，库存已更新` };
 }

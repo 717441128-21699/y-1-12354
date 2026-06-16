@@ -26,6 +26,15 @@ import {
   exportReportToExcel
 } from '../services/report.service';
 import { formatDate } from '../utils/date';
+import {
+  getInventoryList,
+  getInventoryDetail,
+  getInventoryDisposals,
+  getInventoryTimeline,
+  allocateCabinetSlot
+} from '../services/cabinet.service';
+import { queryOperationLogs } from '../services/operation-log.service';
+import { StorageRequirement } from '../types';
 
 let passed = 0;
 let failed = 0;
@@ -221,6 +230,145 @@ function runAllTests() {
     });
     assert(result.success === true, result.message);
     console.log(`     -> 导出文件: ${result.filePath}`);
+  });
+  console.log();
+
+  console.log('[测试组7] 库存筛选、处置追踪与时间线');
+  test('库存列表-全量查询', () => {
+    const r = getInventoryList({ page: 1, pageSize: 20 });
+    assert(Array.isArray(r.list), '应返回list数组');
+    assert(typeof r.total === 'number', '应返回total');
+    if (r.list.length > 0) {
+      const first = r.list[0];
+      assert('days_to_expiry' in first, '应包含days_to_expiry');
+      assert('status_label' in first, '应包含status_label');
+      assert('can_outbound' in first, '应包含can_outbound');
+      assert('available_quantity' in first, '应包含available_quantity');
+      assert('storage_requirement_name' in first, '应包含storage_requirement_name');
+      assert('cabinet_storage_name' in first, '应包含cabinet_storage_name');
+    }
+  });
+  test('库存列表-按耗材ID筛选', () => {
+    const r = getInventoryList({ consumableId: 1, page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.consumable_id === 1), '应全部为指定耗材');
+    }
+  });
+  test('库存列表-按柜位ID筛选', () => {
+    const r = getInventoryList({ cabinetId: 1, page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.cabinet_id === 1), '应全部为指定柜位');
+    }
+  });
+  test('库存列表-按批次号筛选', () => {
+    const one = db.prepare('SELECT batch_no FROM inventory WHERE batch_no IS NOT NULL LIMIT 1').get() as any;
+    if (one) {
+      const r = getInventoryList({ batchNo: one.batch_no, page: 1, pageSize: 20 });
+      assert(r.total > 0, '按批次号应能查到数据');
+      assert(r.list.every((i: any) => i.batch_no === one.batch_no), '批次号应匹配');
+    }
+  });
+  test('库存列表-按状态筛选(near_expiry_locked)', () => {
+    const r = getInventoryList({ status: 'near_expiry_locked', page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.status === 'near_expiry_locked'), '状态应匹配');
+      assert(r.list.every((i: any) => i.can_outbound === false), '临期锁定应不可出库');
+      assert(r.list.every((i: any) => typeof i.lock_reason === 'string'), '应带锁定原因');
+    }
+  });
+  test('库存列表-按状态筛选(normal)', () => {
+    const r = getInventoryList({ status: 'normal', page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.status === 'normal'), '状态应为normal');
+    }
+  });
+  test('库存列表-按临期only筛选', () => {
+    const r = getInventoryList({ nearExpiryOnly: true, page: 1, pageSize: 50 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.days_to_expiry <= 30), '临期only筛选应只返回30天内的数据');
+    }
+  });
+  test('库存列表-按效期范围筛选', () => {
+    const today = new Date();
+    const from = formatDate(new Date(today.getTime() - 30 * 86400000), 'YYYY-MM-DD');
+    const to = formatDate(new Date(today.getTime() + 365 * 86400000), 'YYYY-MM-DD');
+    const r = getInventoryList({ expiryFrom: from, expiryTo: to, page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      for (const it of r.list) {
+        assert(it.expiry_date >= from, `效期应>=${from}`);
+        assert(it.expiry_date <= to + ' 23:59:59' || it.expiry_date <= to, `效期应<=${to}`);
+      }
+    }
+  });
+  test('库存列表-组合筛选(耗材+状态)', () => {
+    const r = getInventoryList({ consumableId: 7, status: 'near_expiry_locked', page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      assert(r.list.every((i: any) => i.consumable_id === 7 && i.status === 'near_expiry_locked'));
+    }
+  });
+  test('库存详情-字段完整性', () => {
+    const one = db.prepare('SELECT id FROM inventory LIMIT 1').get() as any;
+    if (one) {
+      const d = getInventoryDetail(one.id);
+      assert(d !== null, '详情应存在');
+      assert('specification' in d, '应有规格');
+      assert('unit' in d, '应有单位');
+      assert('supplier_name' in d, '应有供应商名');
+      assert('days_to_expiry' in d, '应有days_to_expiry');
+      assert('lock_reason' in d, '应有lock_reason');
+    }
+  });
+  test('库存处置追踪-按库存反查流水', () => {
+    const one = db.prepare(`
+      SELECT ol.related_id
+      FROM operation_logs ol
+      WHERE ol.related_type = 'inventory'
+      LIMIT 1
+    `).get() as any;
+    if (one) {
+      const r = getInventoryDisposals(one.related_id);
+      assert(typeof r.total === 'number', '应返回total');
+      if (r.total > 0) {
+        const first = r.list[0];
+        assert('source' in first, '应含source');
+        assert('batch_no' in first, '应含batch_no');
+        assert('trace_code' in first, '应含trace_code');
+        assert('operator_name' in first, '应含operator_name');
+      }
+    }
+  });
+  test('库存时间线-全生命周期事件', () => {
+    const one = db.prepare('SELECT id FROM inventory LIMIT 1').get() as any;
+    if (one) {
+      const r = getInventoryTimeline(one.id);
+      assert(r.summary.inventory !== null, '应含summary.inventory');
+      assert(Array.isArray(r.events), 'events应为数组');
+      if (r.events.length > 0) {
+        const first = r.events[0];
+        assert('timestamp' in first, '应有timestamp');
+        assert('event_type' in first, '应有event_type');
+        assert('event_label' in first, '应有event_label');
+        assert('operator' in first, '应有operator');
+        assert('is_system' in first.operator, 'operator应有is_system');
+      }
+    }
+  });
+  test('柜位分配失败-完整诊断信息', () => {
+    const r = allocateCabinetSlot(1, 'nonexist' as unknown as StorageRequirement, 'TEST');
+    assert(r.success === false, '应失败');
+    assert(r.errorCode === 'NO_CABINET_MATCH', '错误码应为NO_CABINET_MATCH');
+    assert(r.errorDetail !== undefined, '应含errorDetail');
+    assert(r.errorDetail?.suggestion !== undefined, 'errorDetail应含suggestion');
+    assert(r.errorDetail?.suggestion?.configEntry !== undefined, 'suggestion应含configEntry');
+    assert(r.errorDetail?.cabinetStats !== undefined, '应含cabinetStats');
+  });
+  test('操作流水-效期巡检记录完整', () => {
+    const r = queryOperationLogs({ bizType: 'expiry_alert', page: 1, pageSize: 20 });
+    if (r.total > 0) {
+      const actions = new Set(r.list.map((l: any) => l.action));
+      assert(actions.has('alert') || actions.has('scrap') || actions.has('inventory_check'),
+        '效期相关流水应包含alert/scrap/inventory_check');
+    }
   });
   console.log();
 

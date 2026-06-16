@@ -396,7 +396,24 @@ export function approveRequisitionFinal(
           nearExpiryBlockedQty: lockResult.nearExpiryBlockedQty,
           suggestion: failReason === 'near_expiry'
             ? '请减少申领数量或更换其他批次'
-            : '当前库存不足，请联系库房补货'
+            : '当前库存不足，请联系库房补货',
+          diagnosis: {
+            type: 'stock_lock',
+            failReason,
+            inventory: {
+              requested: req.requested_quantity,
+              available: invSummary.availableQuantity,
+              alreadyLocked: invSummary.lockedQuantity,
+              nearExpiryLocked: invSummary.nearExpiryQuantity,
+              normalTotal: invSummary.normalTotal
+            },
+            suggestion: {
+              text: failReason === 'near_expiry'
+                ? '请减少申领数量或更换其他批次'
+                : '当前库存不足，请联系库房补货',
+              action: failReason === 'near_expiry' ? 'reduce_or_switch_batch' : 'request_restock'
+            }
+          }
         }
       };
     }
@@ -447,6 +464,23 @@ export function approveRequisitionFinal(
       newValue: RequisitionStatus.STOCK_LOCKED,
       status: RequisitionStatus.STOCK_LOCKED
     });
+
+    for (const locked of lockResult.lockedItems) {
+      logOperation({
+        bizType: BizType.INVENTORY,
+        action: LogAction.LOCK,
+        title: '库存被领用锁定',
+        detail: `【${req.consumable_name}】批次${locked.batch_no}，追溯码${locked.trace_code}，锁定${locked.locked_quantity}个，关联领用申请【${req.requisition_no}】ID:${requisitionId}`,
+        relatedType: 'inventory',
+        relatedId: locked.inventory_id,
+        operatorId: approverId,
+        operatorName: approver?.name,
+        operatorRole: approver?.role,
+        oldValue: '0',
+        newValue: String(locked.locked_quantity),
+        status: 'locked'
+      });
+    }
 
     return {
       success: true,

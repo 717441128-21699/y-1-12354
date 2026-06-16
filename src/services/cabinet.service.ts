@@ -1,6 +1,7 @@
 import { getDatabase } from '../database/connection';
 import { StorageRequirement, CabinetStatus } from '../types';
 import { daysUntilExpiry } from '../utils/date';
+import { queryOperationLogs } from './operation-log.service';
 
 export interface CabinetAllocation {
   cabinet_id: number;
@@ -712,4 +713,121 @@ export function consumeInventory(
   } catch (err: any) {
     return { success: false, remaining: 0, message: err.message };
   }
+}
+
+export function getInventoryDisposals(inventoryId: number): { list: any[]; total: number } {
+  const db = getDatabase();
+  const { list, total } = queryOperationLogs({
+    relatedType: 'inventory',
+    relatedId: inventoryId,
+    page: 1,
+    pageSize: 500
+  });
+
+  const inv = db.prepare(`
+    SELECT i.*, c.name as consumable_name, c.code as consumable_code, c.unit
+    FROM inventory i
+    LEFT JOIN consumables c ON i.consumable_id = c.id
+    WHERE i.id = ?
+  `).get(inventoryId) as any;
+
+  const enriched = list.map(log => {
+    let parsed: any = {};
+    try {
+      parsed = JSON.parse(log.detail || '{}');
+    } catch (_) {}
+    const source = log.operator_role === 'system'
+      ? { type: 'system', label: '系统自动触发', name: log.operator_name || '系统' }
+      : { type: 'manual', label: '人工操作', name: log.operator_name || '未知', id: log.operator_id, role: log.operator_role };
+
+    return {
+      id: log.id,
+      biz_type: log.biz_type,
+      action: log.action,
+      title: log.title,
+      detail: log.detail,
+      source,
+      operator_name: log.operator_name,
+      operator_role: log.operator_role,
+      created_at: log.created_at,
+      inventory: inv ? {
+        id: inv.id,
+        batch_no: inv.batch_no,
+        trace_code: inv.trace_code,
+        quantity: inv.quantity,
+        consumable_name: inv.consumable_name,
+        consumable_code: inv.consumable_code
+      } : null,
+      batch_no: inv?.batch_no,
+      trace_code: inv?.trace_code,
+      quantity: inv?.quantity,
+      disposal_no: (log.detail || '').match(/处置单[：:]\s*([A-Z0-9-]+)/)?.[1] || null,
+      status: log.status,
+      old_value: log.old_value,
+      new_value: log.new_value
+    };
+  });
+
+  return { list: enriched, total };
+}
+
+export function getInventoryTimeline(inventoryId: number): { summary: any; events: any[] } {
+  const db = getDatabase();
+  const { list } = queryOperationLogs({
+    relatedType: 'inventory',
+    relatedId: inventoryId,
+    page: 1,
+    pageSize: 500
+  });
+
+  const inventory = getInventoryDetail(inventoryId);
+
+  const eventTypeMap: Record<string, { type: string; label: string; icon: string; severity: string }> = {
+    create: { type: 'stock_in', label: '入库', icon: '📥', severity: 'success' },
+    alert: { type: 'expiry_alert', label: '效期预警', icon: '⚠️', severity: 'warning' },
+    lock: { type: 'requisition_lock', label: '锁定', icon: '🔒', severity: 'info' },
+    unlock: { type: 'requisition_unlock', label: '解锁', icon: '🔓', severity: 'info' },
+    consume: { type: 'consume', label: '消耗', icon: '⚡', severity: 'primary' },
+    return: { type: 'return', label: '退还', icon: '↩️', severity: 'primary' },
+    scrap: { type: 'scrap', label: '报废', icon: '🗑️', severity: 'danger' },
+    inventory_check: { type: 'check', label: '巡检', icon: '🔍', severity: 'secondary' },
+    update: { type: 'update', label: '更新', icon: '📝', severity: 'secondary' }
+  };
+
+  const events = list.map((log, idx) => {
+    const meta = eventTypeMap[log.action] || { type: log.action, label: log.action, icon: '📋', severity: 'secondary' };
+    return {
+      sequence: list.length - idx,
+      id: log.id,
+      timestamp: log.created_at,
+      event_type: meta.type,
+      event_label: meta.label,
+      icon: meta.icon,
+      severity: meta.severity,
+      title: log.title,
+      detail: log.detail,
+      operator: {
+        name: log.operator_name,
+        role: log.operator_role,
+        is_system: log.operator_role === 'system'
+      },
+      status: log.status,
+      change: {
+        old_value: log.old_value,
+        new_value: log.new_value
+      }
+    };
+  });
+
+  return {
+    summary: {
+      inventory,
+      total_events: events.length,
+      event_counts: events.reduce((acc: any, e) => {
+        acc[e.event_type] = (acc[e.event_type] || 0) + 1;
+        return acc;
+      }, {})
+    },
+    events
+  };
 }

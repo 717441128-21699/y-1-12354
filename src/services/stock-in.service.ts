@@ -337,7 +337,7 @@ export function auditStockInRequest(
         request.quantity
       );
 
-      db.prepare(`
+      const invInsertResult = db.prepare(`
         INSERT INTO inventory (
           consumable_id, cabinet_id, slot_id, supplier_id, batch_no, trace_code,
           quantity, production_date, expiry_date, unit_price, stock_in_id
@@ -356,7 +356,7 @@ export function auditStockInRequest(
         requestId
       );
 
-      return { allocation, traceCode };
+      return { allocation, traceCode, inventoryId: Number(invInsertResult.lastInsertRowid) };
     } else {
       db.prepare(`
         UPDATE stock_in_requests
@@ -390,6 +390,20 @@ export function auditStockInRequest(
         oldValue: request.status,
         newValue: StockInStatus.APPROVED,
         status: StockInStatus.APPROVED
+      });
+
+      logOperation({
+        bizType: BizType.INVENTORY,
+        action: LogAction.CREATE,
+        title: '库存入库',
+        detail: `【${request.consumable_name || '耗材'}】批次${request.batch_no}，追溯码${result.traceCode}，入库${request.quantity}个，存放于${result.allocation.cabinet_name} - ${result.allocation.slot_code}（存储要求：${result.allocation.storage_name || '常温普通'}），关联入库申请ID:${requestId}`,
+        relatedType: 'inventory',
+        relatedId: result.inventoryId,
+        operatorId: auditorId,
+        operatorRole: 'warehouse_manager',
+        oldValue: '0',
+        newValue: String(request.quantity),
+        status: 'normal'
       });
 
       return {
@@ -443,19 +457,19 @@ export function auditStockInRequest(
     const errorDetail = err.errorDetail;
     const resp: any = { success: false, message: msg };
 
-    if (errorCode === 'NO_CABINET_MATCH') {
+    if (errorCode === 'NO_CABINET_MATCH' || errorCode === 'NO_SLOT_AVAILABLE') {
       resp.data = {
-        errorCode: 'NO_CABINET_MATCH',
+        errorCode,
         errorCategory: 'cabinet_allocation',
         errorDetail,
-        id: requestId,
-        status: StockInStatus.PENDING
-      };
-    } else if (errorCode === 'NO_SLOT_AVAILABLE') {
-      resp.data = {
-        errorCode: 'NO_SLOT_AVAILABLE',
-        errorCategory: 'cabinet_allocation',
-        errorDetail,
+        diagnosis: {
+          type: 'cabinet_allocation',
+          requiredStorage: errorDetail?.requiredStorage,
+          requiredStorageName: errorDetail?.requiredStorageName,
+          missingStorage: errorDetail?.suggestion?.title,
+          currentOccupancy: errorDetail?.cabinetStats,
+          suggestion: errorDetail?.suggestion
+        },
         id: requestId,
         status: StockInStatus.PENDING
       };

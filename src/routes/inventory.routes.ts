@@ -28,7 +28,9 @@ import {
 } from '../services/operation-log.service';
 import {
   getInventoryList,
-  getInventoryDetail
+  getInventoryDetail,
+  getInventoryDisposals,
+  getInventoryTimeline
 } from '../services/cabinet.service';
 import { AlertType, AlertStatus } from '../types';
 
@@ -226,6 +228,17 @@ router.get('/inventory/:id', (req: Request, res: Response) => {
   const item = getInventoryDetail(Number(req.params.id));
   if (!item) return res.json(fail('库存记录不存在'));
   res.json(success(item));
+});
+
+router.get('/inventory/:id/disposals', (req: Request, res: Response) => {
+  const result = getInventoryDisposals(Number(req.params.id));
+  res.json(success(result));
+});
+
+router.get('/inventory/:id/timeline', (req: Request, res: Response) => {
+  const result = getInventoryTimeline(Number(req.params.id));
+  if (!result.summary.inventory) return res.json(fail('库存记录不存在'));
+  res.json(success(result));
 });
 
 router.get('/operation-logs', (req: Request, res: Response) => {
