@@ -242,6 +242,23 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS operation_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  biz_type TEXT NOT NULL,
+  action TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  related_type TEXT,
+  related_id INTEGER,
+  operator_id INTEGER,
+  operator_name TEXT,
+  operator_role TEXT,
+  old_value TEXT,
+  new_value TEXT,
+  status TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
 CREATE TABLE IF NOT EXISTS requisition_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   requisition_id INTEGER NOT NULL,
@@ -263,6 +280,9 @@ CREATE INDEX IF NOT EXISTS idx_requisitions_department ON requisitions(departmen
 CREATE INDEX IF NOT EXISTS idx_consumption_date ON consumption_records(used_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
 CREATE INDEX IF NOT EXISTS idx_reports_date ON department_reports(report_date);
+CREATE INDEX IF NOT EXISTS idx_oplogs_biz ON operation_logs(biz_type, action);
+CREATE INDEX IF NOT EXISTS idx_oplogs_operator ON operation_logs(operator_id);
+CREATE INDEX IF NOT EXISTS idx_oplogs_time ON operation_logs(created_at);
 `;
 
 const seedDataSQL = `

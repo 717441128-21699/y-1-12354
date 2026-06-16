@@ -4,6 +4,7 @@ import { daysUntilExpiry } from '../utils/date';
 import { generateRequestNo, generateTraceCode } from '../utils/trace-code';
 import { allocateCabinetSlot, updateSlotOccupancy } from './cabinet.service';
 import { sendNotification } from '../utils/notification';
+import { logOperation, BizType, LogAction } from './operation-log.service';
 
 export interface QualificationCheckResult {
   valid: boolean;
@@ -211,6 +212,18 @@ export function createStockInRequest(request: StockInCreateRequest): {
         recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
+    logOperation({
+      bizType: BizType.STOCK_IN,
+      action: LogAction.REJECT,
+      title: '入库申请被退回',
+      detail: `原因：${rejectReason}`,
+      relatedType: 'stock_in',
+      relatedId: requestId,
+      operatorRole: 'system',
+      operatorName: '系统自动校验',
+      status
+    });
+
     return {
       success: false,
       message: '入库申请已退回',
@@ -228,6 +241,18 @@ export function createStockInRequest(request: StockInCreateRequest): {
     relatedType: 'stock_in',
     relatedId: requestId,
     recipientRoles: ['warehouse_manager', 'operating_room_nurse']
+  });
+
+  logOperation({
+    bizType: BizType.STOCK_IN,
+    action: LogAction.CREATE,
+    title: '创建入库申请',
+    detail: `${consumable?.name} x ${request.quantity}${consumable?.unit}，供应商：${supplier?.name}`,
+    relatedType: 'stock_in',
+    relatedId: requestId,
+    operatorId: request.createdBy,
+    operatorRole: 'system',
+    status
   });
 
   return {
@@ -277,9 +302,12 @@ export function auditStockInRequest(
       if (!allocationResult.success || !allocationResult.allocation) {
         const detail = allocationResult.errorDetail;
         const reason = allocationResult.errorCode === 'NO_CABINET_MATCH'
-          ? `CABINET_NO_MATCH: 系统中无支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储条件的智能柜。当前有${detail?.totalCabinetsInSystem}个柜，其中匹配条件${detail?.matchedCabinets}个，请先配置对应存储类型的智能柜再入库`
-          : `CABINET_NO_SLOT: 支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储的${detail?.matchedCabinets}个智能柜均无空闲柜位（共${detail?.totalCabinetsInSystem}柜，有空间${detail?.cabinetsWithSlots}柜），请清理柜位后重试`;
-        throw new Error(reason);
+          ? `系统中无支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储条件的智能柜。`
+          : `支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储的智能柜暂无空闲柜位。`;
+        const err: any = new Error(reason);
+        err.errorCode = allocationResult.errorCode;
+        err.errorDetail = detail;
+        throw err;
       }
 
       const allocation = allocationResult.allocation;
@@ -350,6 +378,20 @@ export function auditStockInRequest(
         recipientRoles: ['warehouse_manager', 'operating_room_nurse']
       });
 
+      logOperation({
+        bizType: BizType.STOCK_IN,
+        action: LogAction.APPROVE,
+        title: '入库审核通过',
+        detail: `已分配至${result.allocation.cabinet_name} - ${result.allocation.slot_code}，追溯码：${result.traceCode}`,
+        relatedType: 'stock_in',
+        relatedId: requestId,
+        operatorId: auditorId,
+        operatorRole: 'warehouse_manager',
+        oldValue: request.status,
+        newValue: StockInStatus.APPROVED,
+        status: StockInStatus.APPROVED
+      });
+
       return {
         success: true,
         message: '入库审核通过，已分配柜位并生成追溯码',
@@ -358,8 +400,11 @@ export function auditStockInRequest(
           request_no: request.request_no,
           status: StockInStatus.APPROVED,
           cabinet_id: result.allocation.cabinet_id,
+          cabinet_name: result.allocation.cabinet_name,
           slot_id: result.allocation.slot_id,
-          trace_code: result.traceCode
+          slot_code: result.allocation.slot_code,
+          trace_code: result.traceCode,
+          storage_requirement: result.allocation.storage_type
         }
       };
     } else {
@@ -372,6 +417,20 @@ export function auditStockInRequest(
           recipientRoles: ['warehouse_manager', 'operating_room_nurse']
       });
 
+      logOperation({
+        bizType: BizType.STOCK_IN,
+        action: LogAction.REJECT,
+        title: '入库审核退回',
+        detail: `原因：${rejectReason || '审核未通过'}`,
+        relatedType: 'stock_in',
+        relatedId: requestId,
+        operatorId: auditorId,
+        operatorRole: 'warehouse_manager',
+        oldValue: request.status,
+        newValue: StockInStatus.REJECTED,
+        status: StockInStatus.REJECTED
+      });
+
       return {
         success: true,
         message: '入库申请已退回',
@@ -380,24 +439,26 @@ export function auditStockInRequest(
     }
   } catch (err: any) {
     const msg: string = err.message || '';
+    const errorCode = err.errorCode;
+    const errorDetail = err.errorDetail;
     const resp: any = { success: false, message: msg };
 
-    if (msg.startsWith('CABINET_NO_MATCH:')) {
+    if (errorCode === 'NO_CABINET_MATCH') {
       resp.data = {
         errorCode: 'NO_CABINET_MATCH',
         errorCategory: 'cabinet_allocation',
+        errorDetail,
         id: requestId,
         status: StockInStatus.PENDING
       };
-      resp.message = msg.replace('CABINET_NO_MATCH:', '').trim();
-    } else if (msg.startsWith('CABINET_NO_SLOT:')) {
+    } else if (errorCode === 'NO_SLOT_AVAILABLE') {
       resp.data = {
         errorCode: 'NO_SLOT_AVAILABLE',
         errorCategory: 'cabinet_allocation',
+        errorDetail,
         id: requestId,
         status: StockInStatus.PENDING
       };
-      resp.message = msg.replace('CABINET_NO_SLOT:', '').trim();
     }
 
     return resp;

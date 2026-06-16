@@ -3,6 +3,7 @@ import { AlertType, AlertStatus } from '../types';
 import { daysUntilExpiry } from '../utils/date';
 import { createAlert, sendNotification } from '../utils/notification';
 import { generateDisposalNo } from '../utils/trace-code';
+import { logOperation, BizType, LogAction } from './operation-log.service';
 
 export interface ExpiryCheckResult {
   alertsCreated: number;
@@ -255,6 +256,18 @@ export function manualDispose(
       content: `${data.itemsCount}项耗材（共${data.totalQty}个）已人工报废，原因：${reason}，处置单号：${data.disposalNo}`,
       relatedType: 'disposal',
       recipientRoles: ['warehouse_manager', 'operating_room_nurse']
+    });
+
+    logOperation({
+      bizType: BizType.DISPOSAL,
+      action: LogAction.SCRAP,
+      title: '人工报废耗材',
+      detail: `${data.itemsCount}项共${data.totalQty}个，原因：${reason}，处置单号：${data.disposalNo}`,
+      relatedType: 'disposal',
+      operatorId: handlerId,
+      operatorName: handlerName,
+      operatorRole: 'warehouse_manager',
+      status: 'scrapped'
     });
 
     return {

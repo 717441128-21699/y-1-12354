@@ -3,6 +3,7 @@ import { RequisitionStatus } from '../types';
 import { generateRequisitionNo } from '../utils/trace-code';
 import { lockInventory, checkInventoryLock } from './cabinet.service';
 import { sendNotification } from '../utils/notification';
+import { logOperation, BizType, LogAction } from './operation-log.service';
 
 export interface RequisitionCreateRequest {
   departmentId: number;
@@ -210,6 +211,19 @@ export function createRequisition(request: RequisitionCreateRequest): {
     recipientRoles: notifyRoles
   });
 
+  logOperation({
+    bizType: BizType.REQUISITION,
+    action: LogAction.CREATE,
+    title: estimation.isOverLimit ? '领用申请创建（超量）' : '领用申请创建',
+    detail: `${consumable.name} x ${request.requestedQuantity}${consumable.unit}，申请人：${applicant.name}`,
+    relatedType: 'requisition',
+    relatedId: requisitionId,
+    operatorId: request.applicantId,
+    operatorName: applicant.name,
+    operatorRole: applicant.role,
+    status
+  });
+
   return {
     success: true,
     message: status === RequisitionStatus.QUANTITY_BLOCKED
@@ -233,7 +247,7 @@ export function approveRequisitionByDepartment(
   approverId: number,
   approved: boolean,
   comment?: string
-): { success: boolean; message: string; data?: any } {
+): { success: boolean; message: string; failReason?: string; data?: any } {
   const db = getDatabase();
 
   const req = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(requisitionId) as any;
@@ -303,6 +317,21 @@ export function approveRequisitionByDepartment(
       : ['warehouse_manager', 'operating_room_nurse']
   });
 
+  logOperation({
+    bizType: BizType.REQUISITION,
+    action: approved ? LogAction.APPROVE : LogAction.REJECT,
+    title: approved ? '科室审核通过' : '科室审核退回',
+    detail: approved ? undefined : `原因：${comment || '科室审核未通过'}`,
+    relatedType: 'requisition',
+    relatedId: requisitionId,
+    operatorId: approverId,
+    operatorName: approver?.name,
+    operatorRole: approver?.role,
+    oldValue: req.status,
+    newValue: nextStatus,
+    status: nextStatus
+  });
+
   return {
     success: true,
     message: approved
@@ -317,7 +346,7 @@ export function approveRequisitionFinal(
   approverId: number,
   approved: boolean,
   comment?: string
-): { success: boolean; message: string; data?: any } {
+): { success: boolean; message: string; failReason?: string; data?: any } {
   const db = getDatabase();
 
   const req = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(requisitionId) as any;
@@ -331,21 +360,44 @@ export function approveRequisitionFinal(
   const approver = db.prepare('SELECT * FROM users WHERE id = ?').get(approverId) as any;
 
   if (approved) {
+    const invSummary = checkInventoryLock(req.consumable_id, req.requested_quantity);
     const lockResult = lockInventory(req.consumable_id, req.requested_quantity, requisitionId);
 
     if (!lockResult.success) {
-      const respData: any = {
-        id: requisitionId,
+      const failReason = lockResult.blockedByNearExpiry ? 'near_expiry' : 'insufficient_stock';
+      logOperation({
+        bizType: BizType.REQUISITION,
+        action: LogAction.LOCK,
+        title: '库存锁定失败',
+        detail: failReason === 'near_expiry'
+          ? `可用${invSummary.availableQuantity}个，另有${lockResult.nearExpiryBlockedQty}个因临期锁定，无法满足${req.requested_quantity}个`
+          : `可用${invSummary.availableQuantity}个，需求${req.requested_quantity}个，库存不足`,
+        relatedType: 'requisition',
+        relatedId: requisitionId,
+        operatorId: approverId,
+        operatorName: approver?.name,
+        operatorRole: approver?.role,
         status: req.status
-      };
-      if (lockResult.blockedByNearExpiry) {
-        respData.blockedReason = 'near_expiry';
-        respData.nearExpiryBlockedQty = lockResult.nearExpiryBlockedQty;
-      }
+      });
+
       return {
         success: false,
         message: lockResult.message || '库存锁定失败',
-        data: respData
+        failReason,
+        data: {
+          id: requisitionId,
+          status: req.status,
+          blockedReason: failReason,
+          requestedQuantity: req.requested_quantity,
+          availableQuantity: invSummary.availableQuantity,
+          lockedQuantity: invSummary.lockedQuantity,
+          nearExpiryQuantity: invSummary.nearExpiryQuantity,
+          blockedByNearExpiry: lockResult.blockedByNearExpiry,
+          nearExpiryBlockedQty: lockResult.nearExpiryBlockedQty,
+          suggestion: failReason === 'near_expiry'
+            ? '请减少申领数量或更换其他批次'
+            : '当前库存不足，请联系库房补货'
+        }
       };
     }
 
@@ -381,6 +433,21 @@ export function approveRequisitionFinal(
       recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
+    logOperation({
+      bizType: BizType.REQUISITION,
+      action: LogAction.LOCK,
+      title: '最终审批通过，库存已锁定',
+      detail: `${req.consumable_name} x ${req.requested_quantity}，锁定${lockResult.lockedItems.length}个批次`,
+      relatedType: 'requisition',
+      relatedId: requisitionId,
+      operatorId: approverId,
+      operatorName: approver?.name,
+      operatorRole: approver?.role,
+      oldValue: req.status,
+      newValue: RequisitionStatus.STOCK_LOCKED,
+      status: RequisitionStatus.STOCK_LOCKED
+    });
+
     return {
       success: true,
       message: '审批通过，库存已锁定',
@@ -388,6 +455,8 @@ export function approveRequisitionFinal(
         id: requisitionId,
         status: RequisitionStatus.STOCK_LOCKED,
         locked_stock: req.requested_quantity,
+        availableQuantity: invSummary.availableQuantity,
+        nearExpiryQuantity: invSummary.nearExpiryQuantity,
         locked_items: lockResult.lockedItems
       }
     };

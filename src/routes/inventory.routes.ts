@@ -13,10 +13,23 @@ import {
   getDisposalList
 } from '../services/expiry.service';
 import {
+  getNotifications,
   getUnreadNotifications,
   markNotificationAsRead,
+  batchMarkNotificationsRead,
+  markAllNotificationsRead,
+  getNotificationTypes,
   handleAlert
 } from '../utils/notification';
+import {
+  queryOperationLogs,
+  getOperationLog,
+  BizType
+} from '../services/operation-log.service';
+import {
+  getInventoryList,
+  getInventoryDetail
+} from '../services/cabinet.service';
 import { AlertType, AlertStatus } from '../types';
 
 const router = Router();
@@ -142,16 +155,106 @@ router.get('/disposals', (req: Request, res: Response) => {
 });
 
 router.get('/notifications', (req: Request, res: Response) => {
-  const { roles } = req.query;
-  const roleList = roles ? (roles as string).split(',') : ['warehouse_manager', 'operating_room_nurse'];
+  const { roles, type, relatedType, readStatus, startDate, endDate, page, pageSize } = req.query;
+  const roleList = roles ? (roles as string).split(',') : undefined;
 
-  const list = getUnreadNotifications(roleList);
-  res.json(success(list));
+  const result = getNotifications({
+    roles: roleList,
+    type: type as string,
+    relatedType: relatedType as string,
+    readStatus: (readStatus as 'unread' | 'read' | 'all') || 'unread',
+    startDate: startDate as string,
+    endDate: endDate as string,
+    page: page ? Number(page) : undefined,
+    pageSize: pageSize ? Number(pageSize) : undefined
+  });
+
+  res.json(success(result));
+});
+
+router.get('/notifications/types', (_req: Request, res: Response) => {
+  const types = getNotificationTypes();
+  res.json(success(types));
 });
 
 router.post('/notifications/:id/read', (req: Request, res: Response) => {
   const marked = markNotificationAsRead(Number(req.params.id));
-  res.json(marked ? success(null, '已标记为已读') : fail('标记失败'));
+  res.json(marked ? success(null, '已标记为已读') : fail('标记失败或已经是已读状态'));
+});
+
+router.post('/notifications/batch-read', (req: Request, res: Response) => {
+  const { ids } = req.body;
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return res.json(fail('请提供要标记的通知ID列表'));
+  }
+  const result = batchMarkNotificationsRead(ids.map(Number));
+  res.json(success(result, `成功标记 ${result.success} 条已读`));
+});
+
+router.post('/notifications/read-all', (req: Request, res: Response) => {
+  const { roles } = req.body;
+  const roleList = roles && Array.isArray(roles) ? roles : undefined;
+  const count = markAllNotificationsRead(roleList);
+  res.json(success({ count }, `已将 ${count} 条未读消息全部标记为已读`));
+});
+
+router.get('/inventory', (req: Request, res: Response) => {
+  const {
+    consumableId, cabinetId, slotId, batchNo, status,
+    storageRequirement, expiryFrom, expiryTo,
+    nearExpiryOnly, page, pageSize
+  } = req.query;
+
+  const result = getInventoryList({
+    consumableId: consumableId ? Number(consumableId) : undefined,
+    cabinetId: cabinetId ? Number(cabinetId) : undefined,
+    slotId: slotId ? Number(slotId) : undefined,
+    batchNo: batchNo as string,
+    status: status as string,
+    storageRequirement: storageRequirement as string,
+    expiryFrom: expiryFrom as string,
+    expiryTo: expiryTo as string,
+    nearExpiryOnly: nearExpiryOnly === 'true',
+    page: page ? Number(page) : undefined,
+    pageSize: pageSize ? Number(pageSize) : undefined
+  });
+
+  res.json(success(result));
+});
+
+router.get('/inventory/:id', (req: Request, res: Response) => {
+  const item = getInventoryDetail(Number(req.params.id));
+  if (!item) return res.json(fail('库存记录不存在'));
+  res.json(success(item));
+});
+
+router.get('/operation-logs', (req: Request, res: Response) => {
+  const {
+    bizType, action, relatedType, relatedId,
+    operatorId, operatorRole, startDate, endDate,
+    page, pageSize
+  } = req.query;
+
+  const result = queryOperationLogs({
+    bizType: bizType as string,
+    action: action as string,
+    relatedType: relatedType as string,
+    relatedId: relatedId ? Number(relatedId) : undefined,
+    operatorId: operatorId ? Number(operatorId) : undefined,
+    operatorRole: operatorRole as string,
+    startDate: startDate as string,
+    endDate: endDate as string,
+    page: page ? Number(page) : undefined,
+    pageSize: pageSize ? Number(pageSize) : undefined
+  });
+
+  res.json(success(result));
+});
+
+router.get('/operation-logs/:id', (req: Request, res: Response) => {
+  const log = getOperationLog(Number(req.params.id));
+  if (!log) return res.json(fail('操作日志不存在'));
+  res.json(success(log));
 });
 
 export default router;

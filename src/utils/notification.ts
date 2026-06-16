@@ -74,37 +74,136 @@ export function createAlert(
   return Number(result.lastInsertRowid);
 }
 
-export function getUnreadNotifications(roles?: string[]): any[] {
+export interface NotificationQueryParams {
+  roles?: string[];
+  type?: string;
+  relatedType?: string;
+  readStatus?: 'unread' | 'read' | 'all';
+  startDate?: string;
+  endDate?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export function getNotifications(params: NotificationQueryParams = {}): { list: any[]; total: number; unreadTotal: number } {
   const db = getDatabase();
 
-  const effectiveRoles = roles && roles.length > 0
-    ? roles
+  const effectiveRoles = params.roles && params.roles.length > 0
+    ? params.roles
     : DEFAULT_ROLES;
 
-  const orConditions = effectiveRoles
-    .map(role => `recipient_roles LIKE ?`)
-    .join(' OR ');
+  const conditions: string[] = [];
+  const values: any[] = [];
 
-  const params = effectiveRoles.map(role => `%${role}%`);
+  const roleConditions = effectiveRoles.map(() => `recipient_roles LIKE ?`).join(' OR ');
+  conditions.push(`(${roleConditions})`);
+  effectiveRoles.forEach(role => values.push(`%${role}%`));
 
-  const stmt = db.prepare(`
+  if (params.type) {
+    conditions.push('type = ?');
+    values.push(params.type);
+  }
+  if (params.relatedType) {
+    conditions.push('related_type = ?');
+    values.push(params.relatedType);
+  }
+  const readStatus = params.readStatus || 'unread';
+  if (readStatus !== 'all') {
+    conditions.push('read_status = ?');
+    values.push(readStatus);
+  }
+  if (params.startDate) {
+    conditions.push('created_at >= ?');
+    values.push(params.startDate);
+  }
+  if (params.endDate) {
+    conditions.push('created_at <= ?');
+    values.push(params.endDate + ' 23:59:59');
+  }
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const unreadStmt = db.prepare(`
+    SELECT COUNT(*) as total FROM notifications
+    WHERE read_status = 'unread' AND (${roleConditions})
+  `);
+  const unreadResult = unreadStmt.get(...effectiveRoles.map(r => `%${r}%`)) as { total: number };
+
+  const totalStmt = db.prepare(`SELECT COUNT(*) as total FROM notifications ${whereClause}`);
+  const { total } = totalStmt.get(...values) as { total: number };
+
+  const page = params.page || 1;
+  const pageSize = params.pageSize || 20;
+  const offset = (page - 1) * pageSize;
+
+  const listStmt = db.prepare(`
     SELECT * FROM notifications
-    WHERE read_status = 'unread'
-    AND (${orConditions})
-    ORDER BY created_at DESC
-    LIMIT 100
+    ${whereClause}
+    ORDER BY created_at DESC, id DESC
+    LIMIT ? OFFSET ?
   `);
 
-  return stmt.all(...params);
+  const list = listStmt.all(...values, pageSize, offset) as any[];
+
+  return { list, total, unreadTotal: unreadResult.total };
+}
+
+export function getUnreadNotifications(roles?: string[]): any[] {
+  const result = getNotifications({ roles, readStatus: 'unread', pageSize: 100 });
+  return result.list;
 }
 
 export function markNotificationAsRead(id: number): boolean {
   const db = getDatabase();
   const stmt = db.prepare(`
-    UPDATE notifications SET read_status = 'read' WHERE id = ?
+    UPDATE notifications SET read_status = 'read' WHERE id = ? AND read_status = 'unread'
   `);
   const result = stmt.run(id);
   return result.changes > 0;
+}
+
+export function batchMarkNotificationsRead(ids: number[], roles?: string[]): { success: number; failed: number } {
+  const db = getDatabase();
+  if (!ids || ids.length === 0) return { success: 0, failed: 0 };
+
+  const placeholders = ids.map(() => '?').join(',');
+  const stmt = db.prepare(`
+    UPDATE notifications
+    SET read_status = 'read'
+    WHERE id IN (${placeholders}) AND read_status = 'unread'
+  `);
+
+  const result = stmt.run(...ids);
+  return {
+    success: result.changes,
+    failed: ids.length - result.changes
+  };
+}
+
+export function markAllNotificationsRead(roles?: string[]): number {
+  const db = getDatabase();
+
+  const effectiveRoles = roles && roles.length > 0 ? roles : DEFAULT_ROLES;
+  const roleConditions = effectiveRoles.map(() => `recipient_roles LIKE ?`).join(' OR ');
+  const params = effectiveRoles.map(role => `%${role}%`);
+
+  const stmt = db.prepare(`
+    UPDATE notifications SET read_status = 'read'
+    WHERE read_status = 'unread' AND (${roleConditions})
+  `);
+
+  const result = stmt.run(...params);
+  return result.changes;
+}
+
+export function getNotificationTypes(): { type: string; count: number }[] {
+  const db = getDatabase();
+  return db.prepare(`
+    SELECT type, COUNT(*) as count
+    FROM notifications
+    GROUP BY type
+    ORDER BY count DESC
+  `).all() as { type: string; count: number }[];
 }
 
 export function handleAlert(id: number): boolean {

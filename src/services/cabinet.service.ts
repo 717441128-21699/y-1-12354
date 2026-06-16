@@ -10,6 +10,8 @@ export interface CabinetAllocation {
   slot_code: string;
   layer: number;
   position: number;
+  storage_type?: string;
+  storage_name?: string;
 }
 
 export interface AllocationResult {
@@ -23,6 +25,15 @@ export interface AllocationResult {
     matchedCabinets: number;
     cabinetsWithSlots: number;
     zoneSearched?: string;
+    cabinetStats?: Record<string, any>;
+    maintenanceCabinets?: number;
+    suggestion?: {
+      type: string;
+      title: string;
+      description: string;
+      configEntry: string;
+      configEntryName: string;
+    };
   };
 }
 
@@ -45,8 +56,30 @@ export function allocateCabinetSlot(
   const storageName = STORAGE_NAMES[storageRequirement] || storageRequirement;
 
   const allCabinets = db.prepare(`
-    SELECT COUNT(*) as cnt FROM smart_cabinets
-  `).get() as { cnt: number };
+    SELECT
+      supported_storage,
+      COUNT(*) as total_cabinets,
+      SUM(total_slots) as total_slots,
+      SUM(used_slots) as used_slots,
+      SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) as maintenance_cabinets
+    FROM smart_cabinets
+    GROUP BY supported_storage
+  `).all() as any[];
+
+  const cabinetStats: Record<string, any> = {};
+  for (const c of allCabinets) {
+    cabinetStats[c.supported_storage] = {
+      storage_type: c.supported_storage,
+      storage_name: STORAGE_NAMES[c.supported_storage] || c.supported_storage,
+      total_cabinets: c.total_cabinets,
+      total_slots: c.total_slots,
+      used_slots: c.used_slots,
+      available_slots: c.total_slots - c.used_slots,
+      maintenance_cabinets: c.maintenance_cabinets
+    };
+  }
+
+  const totalCabinetsInSystem = allCabinets.reduce((s, c) => s + c.total_cabinets, 0);
 
   let matchedCabinets = db.prepare(`
     SELECT c.* FROM smart_cabinets c
@@ -63,10 +96,18 @@ export function allocateCabinetSlot(
       errorDetail: {
         requiredStorage: storageRequirement,
         requiredStorageName: storageName,
-        totalCabinetsInSystem: allCabinets.cnt,
+        totalCabinetsInSystem,
         matchedCabinets: 0,
         cabinetsWithSlots: 0,
-        zoneSearched: preferredZone
+        zoneSearched: preferredZone,
+        cabinetStats,
+        suggestion: {
+          type: 'add_cabinet',
+          title: `缺少${storageName}存储柜`,
+          description: `当前系统中没有支持"${storageName}"存储要求的智能柜，请先在柜位管理中添加对应类型的柜子。`,
+          configEntry: '/system/cabinets',
+          configEntryName: '智能柜管理'
+        }
       }
     };
   }
@@ -78,19 +119,36 @@ export function allocateCabinetSlot(
     }
   }
 
+  const cabinetsWithSlots = matchedCabinets.filter(c => c.used_slots < c.total_slots).length;
+
   matchedCabinets = matchedCabinets.filter(c => c.used_slots < c.total_slots);
 
   if (matchedCabinets.length === 0) {
+    const maintenanceCabinets = db.prepare(`
+      SELECT COUNT(*) as cnt
+      FROM smart_cabinets
+      WHERE supported_storage = ? AND status = ?
+    `).get(storageRequirement, CabinetStatus.MAINTENANCE) as { cnt: number };
+
     return {
       success: false,
       errorCode: 'NO_SLOT_AVAILABLE',
       errorDetail: {
         requiredStorage: storageRequirement,
         requiredStorageName: storageName,
-        totalCabinetsInSystem: allCabinets.cnt,
+        totalCabinetsInSystem,
         matchedCabinets: matchedCount,
         cabinetsWithSlots: 0,
-        zoneSearched: preferredZone
+        zoneSearched: preferredZone,
+        cabinetStats,
+        maintenanceCabinets: maintenanceCabinets.cnt,
+        suggestion: {
+          type: 'expand_capacity',
+          title: `${storageName}柜位已满`,
+          description: `当前${matchedCount}个${storageName}智能柜的所有柜位都已占用，另有${maintenanceCabinets.cnt}个在维护中。请清理库存或扩容。`,
+          configEntry: '/system/cabinets',
+          configEntryName: '智能柜管理'
+        }
       }
     };
   }
@@ -122,7 +180,9 @@ export function allocateCabinetSlot(
           slot_id: existingSlot.id,
           slot_code: existingSlot.slot_code,
           layer: existingSlot.layer,
-          position: existingSlot.position
+          position: existingSlot.position,
+          storage_type: storageRequirement,
+          storage_name: storageName
         }
       };
     }
@@ -146,7 +206,9 @@ export function allocateCabinetSlot(
           slot_id: emptySlot.id,
           slot_code: emptySlot.slot_code,
           layer: emptySlot.layer,
-          position: emptySlot.position
+          position: emptySlot.position,
+          storage_type: storageRequirement,
+          storage_name: storageName
         }
       };
     }
@@ -158,10 +220,18 @@ export function allocateCabinetSlot(
     errorDetail: {
       requiredStorage: storageRequirement,
       requiredStorageName: storageName,
-      totalCabinetsInSystem: allCabinets.cnt,
+      totalCabinetsInSystem,
       matchedCabinets: matchedCount,
       cabinetsWithSlots: matchedCabinets.length,
-      zoneSearched: preferredZone
+      zoneSearched: preferredZone,
+      cabinetStats,
+      suggestion: {
+        type: 'expand_capacity',
+        title: `${storageName}柜位已满`,
+        description: `当前${matchedCount}个${storageName}智能柜的所有柜位都已占用，请清理库存或扩容。`,
+        configEntry: '/system/cabinets',
+        configEntryName: '智能柜管理'
+      }
     }
   };
 }
@@ -247,6 +317,181 @@ export function getInventoryByConsumable(consumableId: number): any[] {
     WHERE i.consumable_id = ?
     ORDER BY i.expiry_date ASC
   `).all(consumableId) as any[];
+}
+
+export interface InventoryListParams {
+  consumableId?: number;
+  cabinetId?: number;
+  slotId?: number;
+  batchNo?: string;
+  status?: string;
+  storageRequirement?: string;
+  expiryFrom?: string;
+  expiryTo?: string;
+  nearExpiryOnly?: boolean;
+  page?: number;
+  pageSize?: number;
+}
+
+function enrichInventoryItem(item: any): any {
+  if (!item) return item;
+  const days = daysUntilExpiry(item.expiry_date);
+  item.days_to_expiry = days;
+
+  let statusLabel = '';
+  let lockReason: string | null = null;
+  let canOutbound = true;
+
+  switch (item.status) {
+    case 'normal':
+      statusLabel = '正常';
+      canOutbound = true;
+      break;
+    case 'near_expiry_locked':
+      statusLabel = '临期锁定';
+      canOutbound = false;
+      lockReason = '距离有效期不足30天，已锁定禁止出库';
+      break;
+    case 'scrapped':
+      statusLabel = '已报废';
+      canOutbound = false;
+      lockReason = '耗材已报废处置';
+      break;
+    case 'depleted':
+      statusLabel = '已耗尽';
+      canOutbound = false;
+      lockReason = '库存已消耗完毕';
+      break;
+    default:
+      statusLabel = item.status || '未知';
+      canOutbound = true;
+  }
+
+  item.status_label = statusLabel;
+  item.lock_reason = lockReason;
+  item.can_outbound = canOutbound;
+  item.available_quantity = item.quantity - (item.locked_quantity || 0);
+
+  return item;
+}
+
+export function getInventoryList(params: InventoryListParams = {}): { list: any[]; total: number } {
+  const db = getDatabase();
+  const conditions: string[] = [];
+  const values: any[] = [];
+
+  if (params.consumableId !== undefined) {
+    conditions.push('i.consumable_id = ?');
+    values.push(params.consumableId);
+  }
+  if (params.cabinetId !== undefined) {
+    conditions.push('i.cabinet_id = ?');
+    values.push(params.cabinetId);
+  }
+  if (params.slotId !== undefined) {
+    conditions.push('i.slot_id = ?');
+    values.push(params.slotId);
+  }
+  if (params.batchNo) {
+    conditions.push('i.batch_no LIKE ?');
+    values.push(`%${params.batchNo}%`);
+  }
+  if (params.status) {
+    conditions.push('i.status = ?');
+    values.push(params.status);
+  }
+  if (params.storageRequirement) {
+    conditions.push('c.storage_requirement = ?');
+    values.push(params.storageRequirement);
+  }
+  if (params.expiryFrom) {
+    conditions.push('DATE(i.expiry_date) >= DATE(?)');
+    values.push(params.expiryFrom);
+  }
+  if (params.expiryTo) {
+    conditions.push('DATE(i.expiry_date) <= DATE(?)');
+    values.push(params.expiryTo);
+  }
+  if (params.nearExpiryOnly) {
+    conditions.push("DATE(i.expiry_date) <= DATE('now', 'localtime', '+30 days')");
+    conditions.push("i.quantity > 0");
+  }
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const totalStmt = db.prepare(`
+    SELECT COUNT(*) as total FROM inventory i
+    LEFT JOIN consumables c ON i.consumable_id = c.id
+    ${whereClause}
+  `);
+  const { total } = totalStmt.get(...values) as { total: number };
+
+  const page = params.page || 1;
+  const pageSize = params.pageSize || 20;
+  const offset = (page - 1) * pageSize;
+
+  const listStmt = db.prepare(`
+    SELECT
+      i.*,
+      c.name as consumable_name,
+      c.code as consumable_code,
+      c.category as consumable_category,
+      c.storage_requirement,
+      c.storage_requirement_name,
+      sc.code as cabinet_code,
+      sc.name as cabinet_name,
+      sc.storage_type as cabinet_storage_type,
+      cs.slot_code,
+      cs.layer,
+      cs.position,
+      s.name as supplier_name,
+      s.code as supplier_code
+    FROM inventory i
+    LEFT JOIN consumables c ON i.consumable_id = c.id
+    LEFT JOIN smart_cabinets sc ON i.cabinet_id = sc.id
+    LEFT JOIN cabinet_slots cs ON i.slot_id = cs.id
+    LEFT JOIN suppliers s ON i.supplier_id = s.id
+    ${whereClause}
+    ORDER BY i.expiry_date ASC, i.created_at DESC
+    LIMIT ? OFFSET ?
+  `);
+
+  const rawList = listStmt.all(...values, pageSize, offset) as any[];
+  const list = rawList.map(enrichInventoryItem);
+
+  return { list, total };
+}
+
+export function getInventoryDetail(id: number): any | null {
+  const db = getDatabase();
+  const item = db.prepare(`
+    SELECT
+      i.*,
+      c.name as consumable_name,
+      c.code as consumable_code,
+      c.category as consumable_category,
+      c.specification,
+      c.unit,
+      c.storage_requirement,
+      c.storage_requirement_name,
+      sc.code as cabinet_code,
+      sc.name as cabinet_name,
+      sc.storage_type as cabinet_storage_type,
+      cs.slot_code,
+      cs.layer,
+      cs.position,
+      s.name as supplier_name,
+      s.code as supplier_code
+    FROM inventory i
+    LEFT JOIN consumables c ON i.consumable_id = c.id
+    LEFT JOIN smart_cabinets sc ON i.cabinet_id = sc.id
+    LEFT JOIN cabinet_slots cs ON i.slot_id = cs.id
+    LEFT JOIN suppliers s ON i.supplier_id = s.id
+    WHERE i.id = ?
+  `).get(id) as any;
+
+  if (!item) return null;
+  return enrichInventoryItem(item);
 }
 
 export function getExpiringInventory(days: number = 30): any[] {
