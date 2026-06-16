@@ -2,6 +2,7 @@ import { getDatabase } from '../database/connection';
 import { ConsumptionStatus, RequisitionStatus } from '../types';
 import { consumeInventory } from './cabinet.service';
 import { sendNotification } from '../utils/notification';
+import { daysUntilExpiry } from '../utils/date';
 
 export interface ConsumptionCreateRequest {
   requisitionId?: number;
@@ -34,20 +35,34 @@ export function recordConsumption(request: ConsumptionCreateRequest): {
     return { success: false, message: '追溯码对应的库存不存在' };
   }
 
-  if (inventory.expiry_date) {
-    const expDate = new Date(inventory.expiry_date);
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    expDate.setHours(0, 0, 0, 0);
+  if (inventory.status === 'near_expiry_locked') {
+    const daysLeft = daysUntilExpiry(inventory.expiry_date);
+    return {
+      success: false,
+      message: `[临期锁定] 该批次耗材已因临近效期锁定出库（剩余${daysLeft}天，有效期至${inventory.expiry_date}），请更换批次使用`,
+      data: {
+        blockedReason: 'near_expiry',
+        daysLeft,
+        expiryDate: inventory.expiry_date,
+        traceCode: inventory.trace_code
+      }
+    };
+  }
 
-    const daysToExpiry = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+  if (inventory.status === 'scrapped') {
+    return {
+      success: false,
+      message: '[已报废] 该批次耗材已被报废，无法出库',
+      data: { blockedReason: 'scrapped', traceCode: inventory.trace_code }
+    };
+  }
 
-    if (daysToExpiry <= 30) {
-      return {
-        success: false,
-        message: `耗材临近效期（剩余${daysToExpiry}天，有效期至${inventory.expiry_date}），已锁定出库，请更换批次`
-      };
-    }
+  if (inventory.status !== 'normal') {
+    return {
+      success: false,
+      message: `[状态异常] 库存状态为 ${inventory.status}，无法出库`,
+      data: { blockedReason: inventory.status, traceCode: inventory.trace_code }
+    };
   }
 
   if (request.quantityUsed > inventory.quantity) {
@@ -127,7 +142,7 @@ export function recordConsumption(request: ConsumptionCreateRequest): {
       content: `${inventory.consumable_name} x ${request.quantityUsed}${inventory.unit}已登记使用，追溯码：${request.traceCode}，剩余库存：${result.remaining}`,
       relatedType: 'consumption',
       relatedId: result.id,
-      recipientRoles: ['warehouse_manager']
+      recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
     return {
@@ -217,7 +232,7 @@ export function autoInventoryByCabinet(cabinetId: number): {
       content: `智能柜【${cabinet.code} ${cabinet.name}】盘点发现${discrepantItems.length}项差异，请核实处理`,
       relatedType: 'cabinet',
       relatedId: cabinetId,
-      recipientRoles: ['warehouse_manager']
+      recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
   }
 

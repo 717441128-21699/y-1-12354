@@ -12,35 +12,96 @@ export interface CabinetAllocation {
   position: number;
 }
 
+export interface AllocationResult {
+  success: boolean;
+  allocation?: CabinetAllocation;
+  errorCode?: 'NO_CABINET_MATCH' | 'NO_SLOT_AVAILABLE' | 'CABINET_MAINTENANCE';
+  errorDetail?: {
+    requiredStorage: string;
+    requiredStorageName: string;
+    totalCabinetsInSystem: number;
+    matchedCabinets: number;
+    cabinetsWithSlots: number;
+    zoneSearched?: string;
+  };
+}
+
+const STORAGE_NAMES: Record<string, string> = {
+  normal: '常温普通',
+  refrigerated: '冷藏',
+  frozen: '冷冻',
+  light_protected: '避光',
+  sterile: '无菌'
+};
+
 export function allocateCabinetSlot(
   consumableId: number,
   storageRequirement: StorageRequirement,
   batchNo: string,
   preferredZone?: string
-): CabinetAllocation | null {
+): AllocationResult {
   const db = getDatabase();
 
-  let cabinets = db.prepare(`
+  const storageName = STORAGE_NAMES[storageRequirement] || storageRequirement;
+
+  const allCabinets = db.prepare(`
+    SELECT COUNT(*) as cnt FROM smart_cabinets
+  `).get() as { cnt: number };
+
+  let matchedCabinets = db.prepare(`
     SELECT c.* FROM smart_cabinets c
-    WHERE c.status = ?
-    AND c.used_slots < c.total_slots
-    AND c.supported_storage IN (?, 'normal')
-  `).all(CabinetStatus.AVAILABLE, storageRequirement) as any[];
+    WHERE c.status != ?
+    AND c.supported_storage = ?
+  `).all(CabinetStatus.MAINTENANCE, storageRequirement) as any[];
+
+  const matchedCount = matchedCabinets.length;
+
+  if (matchedCabinets.length === 0) {
+    return {
+      success: false,
+      errorCode: 'NO_CABINET_MATCH',
+      errorDetail: {
+        requiredStorage: storageRequirement,
+        requiredStorageName: storageName,
+        totalCabinetsInSystem: allCabinets.cnt,
+        matchedCabinets: 0,
+        cabinetsWithSlots: 0,
+        zoneSearched: preferredZone
+      }
+    };
+  }
 
   if (preferredZone) {
-    const zonePreferred = cabinets.filter(c => c.zone === preferredZone);
+    const zonePreferred = matchedCabinets.filter(c => c.zone === preferredZone);
     if (zonePreferred.length > 0) {
-      cabinets = zonePreferred;
+      matchedCabinets = zonePreferred;
     }
   }
 
-  cabinets.sort((a, b) => {
+  matchedCabinets = matchedCabinets.filter(c => c.used_slots < c.total_slots);
+
+  if (matchedCabinets.length === 0) {
+    return {
+      success: false,
+      errorCode: 'NO_SLOT_AVAILABLE',
+      errorDetail: {
+        requiredStorage: storageRequirement,
+        requiredStorageName: storageName,
+        totalCabinetsInSystem: allCabinets.cnt,
+        matchedCabinets: matchedCount,
+        cabinetsWithSlots: 0,
+        zoneSearched: preferredZone
+      }
+    };
+  }
+
+  matchedCabinets.sort((a, b) => {
     const aUsage = a.used_slots / a.total_slots;
     const bUsage = b.used_slots / b.total_slots;
     return aUsage - bUsage;
   });
 
-  for (const cabinet of cabinets) {
+  for (const cabinet of matchedCabinets) {
     const existingSlot = db.prepare(`
       SELECT * FROM cabinet_slots
       WHERE cabinet_id = ?
@@ -53,13 +114,16 @@ export function allocateCabinetSlot(
 
     if (existingSlot) {
       return {
-        cabinet_id: cabinet.id,
-        cabinet_code: cabinet.code,
-        cabinet_name: cabinet.name,
-        slot_id: existingSlot.id,
-        slot_code: existingSlot.slot_code,
-        layer: existingSlot.layer,
-        position: existingSlot.position
+        success: true,
+        allocation: {
+          cabinet_id: cabinet.id,
+          cabinet_code: cabinet.code,
+          cabinet_name: cabinet.name,
+          slot_id: existingSlot.id,
+          slot_code: existingSlot.slot_code,
+          layer: existingSlot.layer,
+          position: existingSlot.position
+        }
       };
     }
 
@@ -74,18 +138,32 @@ export function allocateCabinetSlot(
 
     if (emptySlot) {
       return {
-        cabinet_id: cabinet.id,
-        cabinet_code: cabinet.code,
-        cabinet_name: cabinet.name,
-        slot_id: emptySlot.id,
-        slot_code: emptySlot.slot_code,
-        layer: emptySlot.layer,
-        position: emptySlot.position
+        success: true,
+        allocation: {
+          cabinet_id: cabinet.id,
+          cabinet_code: cabinet.code,
+          cabinet_name: cabinet.name,
+          slot_id: emptySlot.id,
+          slot_code: emptySlot.slot_code,
+          layer: emptySlot.layer,
+          position: emptySlot.position
+        }
       };
     }
   }
 
-  return null;
+  return {
+    success: false,
+    errorCode: 'NO_SLOT_AVAILABLE',
+    errorDetail: {
+      requiredStorage: storageRequirement,
+      requiredStorageName: storageName,
+      totalCabinetsInSystem: allCabinets.cnt,
+      matchedCabinets: matchedCount,
+      cabinetsWithSlots: matchedCabinets.length,
+      zoneSearched: preferredZone
+    }
+  };
 }
 
 export function updateSlotOccupancy(slotId: number, consumableId: number, batchNo: string, expiryDate: string, addQuantity: number): void {
@@ -193,23 +271,34 @@ export function getExpiringInventory(days: number = 30): any[] {
   `).all(days) as any[];
 }
 
-export function checkInventoryLock(consumableId: number, quantity: number): { available: boolean; availableQuantity: number } {
+export function checkInventoryLock(consumableId: number, quantity: number): {
+  available: boolean;
+  availableQuantity: number;
+  nearExpiryQuantity: number;
+  lockedQuantity: number;
+  normalTotal: number;
+} {
   const db = getDatabase();
   const result = db.prepare(`
     SELECT
-      SUM(quantity) as total,
-      SUM(locked_quantity) as locked
+      SUM(CASE WHEN status = 'normal' THEN quantity ELSE 0 END) as normal_total,
+      SUM(CASE WHEN status = 'normal' THEN locked_quantity ELSE 0 END) as normal_locked,
+      SUM(CASE WHEN status = 'near_expiry_locked' THEN quantity ELSE 0 END) as near_expiry_total
     FROM inventory
-    WHERE consumable_id = ? AND status = 'normal'
-  `).get(consumableId) as { total: number | null; locked: number | null };
+    WHERE consumable_id = ?
+  `).get(consumableId) as { normal_total: number | null; normal_locked: number | null; near_expiry_total: number | null };
 
-  const total = result.total || 0;
-  const locked = result.locked || 0;
-  const available = total - locked;
+  const normalTotal = result.normal_total || 0;
+  const lockedQuantity = result.normal_locked || 0;
+  const availableQuantity = normalTotal - lockedQuantity;
+  const nearExpiryQuantity = result.near_expiry_total || 0;
 
   return {
-    available: available >= quantity,
-    availableQuantity: available
+    available: availableQuantity >= quantity,
+    availableQuantity,
+    nearExpiryQuantity,
+    lockedQuantity,
+    normalTotal
   };
 }
 
@@ -218,12 +307,19 @@ export function lockInventory(
   quantity: number,
   requisitionId: number,
   useFifo: boolean = true
-): { success: boolean; lockedItems: any[]; message?: string } {
+): { success: boolean; lockedItems: any[]; message?: string; blockedByNearExpiry?: boolean; nearExpiryBlockedQty?: number } {
   const db = getDatabase();
   const lockedItems: any[] = [];
   let remainingToLock = quantity;
 
   const orderClause = useFifo ? 'expiry_date ASC, created_at ASC' : 'expiry_date DESC, created_at ASC';
+
+  const nearExpiryResult = db.prepare(`
+    SELECT COALESCE(SUM(quantity), 0) as near_qty
+    FROM inventory
+    WHERE consumable_id = ? AND status = 'near_expiry_locked'
+  `).get(consumableId) as { near_qty: number };
+  const nearExpiryQty = nearExpiryResult.near_qty;
 
   const tx = db.transaction(() => {
     const availableItems = db.prepare(`
@@ -251,6 +347,7 @@ export function lockInventory(
         inventory_id: item.id,
         trace_code: item.trace_code,
         batch_no: item.batch_no,
+        expiry_date: item.expiry_date,
         locked_quantity: toLock,
         cabinet_id: item.cabinet_id,
         slot_id: item.slot_id
@@ -260,7 +357,11 @@ export function lockInventory(
     }
 
     if (remainingToLock > 0) {
-      throw new Error(`库存不足，还需要 ${remainingToLock} 个才能满足锁定需求`);
+      if (nearExpiryQty > 0) {
+        throw new Error(`NEAR_EXPIRY_BLOCKED: 可用库存不足，还需 ${remainingToLock} 个。另有 ${nearExpiryQty} 个因临近效期（30天内）被锁定不可出库，请更换批次或联系库房处理`);
+      } else {
+        throw new Error(`库存不足，还需要 ${remainingToLock} 个才能满足锁定需求`);
+      }
     }
   });
 
@@ -268,7 +369,15 @@ export function lockInventory(
     tx();
     return { success: true, lockedItems };
   } catch (err: any) {
-    return { success: false, lockedItems: [], message: err.message };
+    const msg: string = err.message || '';
+    const isNearExpiryBlocked = msg.startsWith('NEAR_EXPIRY_BLOCKED:');
+    return {
+      success: false,
+      lockedItems: [],
+      message: isNearExpiryBlocked ? msg.replace('NEAR_EXPIRY_BLOCKED:', '').trim() : msg,
+      blockedByNearExpiry: isNearExpiryBlocked,
+      nearExpiryBlockedQty: isNearExpiryBlocked ? nearExpiryQty : undefined
+    };
   }
 }
 

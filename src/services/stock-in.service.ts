@@ -208,7 +208,7 @@ export function createStockInRequest(request: StockInCreateRequest): {
       content: `入库申请【${requestNo}】因资质校验未通过，原因：${rejectReason}`,
       relatedType: 'stock_in',
       relatedId: requestId,
-      recipientRoles: ['warehouse_manager']
+        recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
     return {
@@ -227,7 +227,7 @@ export function createStockInRequest(request: StockInCreateRequest): {
     content: `收到新的入库申请【${requestNo}】${consumable?.name} x ${request.quantity}${consumable?.unit}，待审核`,
     relatedType: 'stock_in',
     relatedId: requestId,
-    recipientRoles: ['warehouse_manager']
+    recipientRoles: ['warehouse_manager', 'operating_room_nurse']
   });
 
   return {
@@ -268,15 +268,21 @@ export function auditStockInRequest(
       const consumable = db.prepare('SELECT * FROM consumables WHERE id = ?').get(request.consumable_id) as any;
       const supplier = db.prepare('SELECT * FROM suppliers WHERE id = ?').get(request.supplier_id) as any;
 
-      const allocation = allocateCabinetSlot(
+      const allocationResult = allocateCabinetSlot(
         request.consumable_id,
         consumable.storage_requirement,
         request.batch_no
       );
 
-      if (!allocation) {
-        throw new Error('无可用柜位，请检查智能柜配置');
+      if (!allocationResult.success || !allocationResult.allocation) {
+        const detail = allocationResult.errorDetail;
+        const reason = allocationResult.errorCode === 'NO_CABINET_MATCH'
+          ? `CABINET_NO_MATCH: 系统中无支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储条件的智能柜。当前有${detail?.totalCabinetsInSystem}个柜，其中匹配条件${detail?.matchedCabinets}个，请先配置对应存储类型的智能柜再入库`
+          : `CABINET_NO_SLOT: 支持【${detail?.requiredStorageName || consumable.storage_requirement}】存储的${detail?.matchedCabinets}个智能柜均无空闲柜位（共${detail?.totalCabinetsInSystem}柜，有空间${detail?.cabinetsWithSlots}柜），请清理柜位后重试`;
+        throw new Error(reason);
       }
+
+      const allocation = allocationResult.allocation;
 
       const traceCode = generateTraceCode(
         consumable.code,
@@ -363,7 +369,7 @@ export function auditStockInRequest(
         content: `入库申请【${request.request_no}】审核未通过，原因：${rejectReason || '审核未通过'}`,
         relatedType: 'stock_in',
         relatedId: requestId,
-        recipientRoles: ['warehouse_manager']
+          recipientRoles: ['warehouse_manager', 'operating_room_nurse']
       });
 
       return {
@@ -373,7 +379,28 @@ export function auditStockInRequest(
       };
     }
   } catch (err: any) {
-    return { success: false, message: err.message };
+    const msg: string = err.message || '';
+    const resp: any = { success: false, message: msg };
+
+    if (msg.startsWith('CABINET_NO_MATCH:')) {
+      resp.data = {
+        errorCode: 'NO_CABINET_MATCH',
+        errorCategory: 'cabinet_allocation',
+        id: requestId,
+        status: StockInStatus.PENDING
+      };
+      resp.message = msg.replace('CABINET_NO_MATCH:', '').trim();
+    } else if (msg.startsWith('CABINET_NO_SLOT:')) {
+      resp.data = {
+        errorCode: 'NO_SLOT_AVAILABLE',
+        errorCategory: 'cabinet_allocation',
+        id: requestId,
+        status: StockInStatus.PENDING
+      };
+      resp.message = msg.replace('CABINET_NO_SLOT:', '').trim();
+    }
+
+    return resp;
   }
 }
 

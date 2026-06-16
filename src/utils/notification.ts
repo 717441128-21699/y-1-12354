@@ -74,21 +74,28 @@ export function createAlert(
   return Number(result.lastInsertRowid);
 }
 
-export function getUnreadNotifications(roles: string[]): any[] {
+export function getUnreadNotifications(roles?: string[]): any[] {
   const db = getDatabase();
-  const placeholders = roles.map(() => '?').join(',');
+
+  const effectiveRoles = roles && roles.length > 0
+    ? roles
+    : DEFAULT_ROLES;
+
+  const orConditions = effectiveRoles
+    .map(role => `recipient_roles LIKE ?`)
+    .join(' OR ');
+
+  const params = effectiveRoles.map(role => `%${role}%`);
 
   const stmt = db.prepare(`
     SELECT * FROM notifications
     WHERE read_status = 'unread'
-    AND (
-      ${roles.map(role => `recipient_roles LIKE '%' || ? || '%'`).join(' OR ')}
-    )
+    AND (${orConditions})
     ORDER BY created_at DESC
     LIMIT 100
   `);
 
-  return stmt.all(...roles, ...roles);
+  return stmt.all(...params);
 }
 
 export function markNotificationAsRead(id: number): boolean {

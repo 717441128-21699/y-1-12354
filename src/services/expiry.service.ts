@@ -102,22 +102,36 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
           WHERE related_type = 'inventory' AND related_id = ? AND type = ?
         `).get(item.id, AlertType.EXPIRY_7);
 
-        if (!existingAlert) {
-          createAlert(
-            AlertType.EXPIRY_7,
-            `耗材7天内过期预警（${daysLeft}天）`,
-            `【${item.consumable_name}】批次${item.batch_no}将在${daysLeft}天后过期（${item.expiry_date}），追溯码${item.trace_code}，数量${item.quantity}，请尽快使用或处理`,
-            'inventory',
-            item.id
-          );
+        let alreadyLocked = item.status === 'near_expiry_locked';
 
-          db.prepare(`
-            UPDATE cabinet_slots SET locked = 1 WHERE id = ?
-          `).run(item.slot_id);
+        if (!existingAlert || !alreadyLocked) {
+          if (!existingAlert) {
+            createAlert(
+              AlertType.EXPIRY_7,
+              `耗材7天内过期预警（${daysLeft}天）`,
+              `【${item.consumable_name}】批次${item.batch_no}将在${daysLeft}天后过期（${item.expiry_date}），追溯码${item.trace_code}，数量${item.quantity}，已锁定出库禁止领用`,
+              'inventory',
+              item.id
+            );
+          }
+
+          if (!alreadyLocked) {
+            db.prepare(`
+              UPDATE inventory
+              SET status = 'near_expiry_locked',
+                  updated_at = datetime('now', 'localtime')
+              WHERE id = ?
+            `).run(item.id);
+
+            db.prepare(`
+              UPDATE cabinet_slots SET locked = 1 WHERE id = ?
+            `).run(item.slot_id);
+
+            result.itemsLocked++;
+          }
 
           result.details.alert7.push(item);
-          result.alertsCreated++;
-          result.itemsLocked++;
+          if (!existingAlert) result.alertsCreated++;
         }
       } else if (daysLeft <= 30) {
         const existingAlert = db.prepare(`
@@ -125,17 +139,36 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
           WHERE related_type = 'inventory' AND related_id = ? AND type = ?
         `).get(item.id, AlertType.EXPIRY_30);
 
-        if (!existingAlert) {
-          createAlert(
-            AlertType.EXPIRY_30,
-            `耗材30天内过期预警（${daysLeft}天）`,
-            `【${item.consumable_name}】批次${item.batch_no}将在${daysLeft}天后过期（${item.expiry_date}），追溯码${item.trace_code}，数量${item.quantity}，请合理安排使用顺序`,
-            'inventory',
-            item.id
-          );
+        let alreadyLocked = item.status === 'near_expiry_locked';
+
+        if (!existingAlert || !alreadyLocked) {
+          if (!existingAlert) {
+            createAlert(
+              AlertType.EXPIRY_30,
+              `耗材30天内过期预警（${daysLeft}天）`,
+              `【${item.consumable_name}】批次${item.batch_no}将在${daysLeft}天后过期（${item.expiry_date}），追溯码${item.trace_code}，数量${item.quantity}，已锁定出库禁止领用`,
+              'inventory',
+              item.id
+            );
+          }
+
+          if (!alreadyLocked) {
+            db.prepare(`
+              UPDATE inventory
+              SET status = 'near_expiry_locked',
+                  updated_at = datetime('now', 'localtime')
+              WHERE id = ?
+            `).run(item.id);
+
+            db.prepare(`
+              UPDATE cabinet_slots SET locked = 1 WHERE id = ?
+            `).run(item.slot_id);
+
+            result.itemsLocked++;
+          }
 
           result.details.alert30.push(item);
-          result.alertsCreated++;
+          if (!existingAlert) result.alertsCreated++;
         }
       }
     }
@@ -221,7 +254,7 @@ export function manualDispose(
       title: '耗材人工报废',
       content: `${data.itemsCount}项耗材（共${data.totalQty}个）已人工报废，原因：${reason}，处置单号：${data.disposalNo}`,
       relatedType: 'disposal',
-      recipientRoles: ['warehouse_manager']
+      recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
     return {

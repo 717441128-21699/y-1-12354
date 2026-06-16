@@ -194,8 +194,8 @@ export function createRequisition(request: RequisitionCreateRequest): {
   const requisitionId = tx();
 
   const notifyRoles = estimation.isOverLimit
-    ? ['department_head', 'warehouse_manager']
-    : ['department_head'];
+    ? ['department_head', 'warehouse_manager', 'operating_room_nurse']
+    : ['department_head', 'warehouse_manager', 'operating_room_nurse'];
 
   sendNotification({
     type: estimation.isOverLimit ? 'requisition_over_limit' : 'requisition_created',
@@ -299,8 +299,8 @@ export function approveRequisitionByDepartment(
     relatedType: 'requisition',
     relatedId: requisitionId,
     recipientRoles: approved
-      ? (nextStatus === RequisitionStatus.QUANTITY_APPROVED ? ['warehouse_manager'] : ['warehouse_manager', 'operating_room_nurse'])
-      : ['warehouse_manager']
+      ? (nextStatus === RequisitionStatus.QUANTITY_APPROVED ? ['warehouse_manager', 'operating_room_nurse'] : ['warehouse_manager', 'operating_room_nurse'])
+      : ['warehouse_manager', 'operating_room_nurse']
   });
 
   return {
@@ -334,9 +334,18 @@ export function approveRequisitionFinal(
     const lockResult = lockInventory(req.consumable_id, req.requested_quantity, requisitionId);
 
     if (!lockResult.success) {
+      const respData: any = {
+        id: requisitionId,
+        status: req.status
+      };
+      if (lockResult.blockedByNearExpiry) {
+        respData.blockedReason = 'near_expiry';
+        respData.nearExpiryBlockedQty = lockResult.nearExpiryBlockedQty;
+      }
       return {
         success: false,
-        message: `库存锁定失败：${lockResult.message}`
+        message: lockResult.message || '库存锁定失败',
+        data: respData
       };
     }
 
@@ -408,7 +417,7 @@ export function approveRequisitionFinal(
       content: `领用申请【${req.requisition_no}】最终审批未通过：${comment || '审批未通过'}`,
       relatedType: 'requisition',
       relatedId: requisitionId,
-      recipientRoles: ['warehouse_manager']
+      recipientRoles: ['warehouse_manager', 'operating_room_nurse']
     });
 
     return {
