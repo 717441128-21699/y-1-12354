@@ -350,7 +350,7 @@ function enrichInventoryItem(item: any): any {
     case 'near_expiry_locked':
       statusLabel = '临期锁定';
       canOutbound = false;
-      lockReason = '距离有效期不足30天，已锁定禁止出库';
+      lockReason = `距离效期剩余${days}天，不足30天已锁定禁止出库`;
       break;
     case 'scrapped':
       statusLabel = '已报废';
@@ -371,6 +371,13 @@ function enrichInventoryItem(item: any): any {
   item.lock_reason = lockReason;
   item.can_outbound = canOutbound;
   item.available_quantity = item.quantity - (item.locked_quantity || 0);
+
+  if (item.storage_requirement) {
+    item.storage_requirement_name = STORAGE_NAMES[item.storage_requirement] || item.storage_requirement;
+  }
+  if (item.cabinet_storage_type) {
+    item.cabinet_storage_name = STORAGE_NAMES[item.cabinet_storage_type] || item.cabinet_storage_type;
+  }
 
   return item;
 }
@@ -436,11 +443,12 @@ export function getInventoryList(params: InventoryListParams = {}): { list: any[
       c.name as consumable_name,
       c.code as consumable_code,
       c.category as consumable_category,
+      c.specification,
+      c.unit,
       c.storage_requirement,
-      c.storage_requirement_name,
       sc.code as cabinet_code,
       sc.name as cabinet_name,
-      sc.storage_type as cabinet_storage_type,
+      sc.supported_storage as cabinet_storage_type,
       cs.slot_code,
       cs.layer,
       cs.position,
@@ -473,10 +481,9 @@ export function getInventoryDetail(id: number): any | null {
       c.specification,
       c.unit,
       c.storage_requirement,
-      c.storage_requirement_name,
       sc.code as cabinet_code,
       sc.name as cabinet_name,
-      sc.storage_type as cabinet_storage_type,
+      sc.supported_storage as cabinet_storage_type,
       cs.slot_code,
       cs.layer,
       cs.position,

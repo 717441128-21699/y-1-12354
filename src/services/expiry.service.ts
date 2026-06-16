@@ -25,6 +25,8 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
     details: { alert30: [], alert7: [], expired: [] }
   };
 
+  const logInserts: any[] = [];
+
   const tx = db.transaction(() => {
     const expiringItems = db.prepare(`
       SELECT i.*,
@@ -93,6 +95,20 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
             WHERE id = ?
           `).run(item.quantity, item.quantity, item.quantity, item.quantity, item.slot_id);
 
+          logInserts.push({
+            bizType: BizType.EXPIRY_ALERT,
+            action: LogAction.SCRAP,
+            title: '过期自动报废',
+            detail: `【${item.consumable_name}】批次${item.batch_no}已过期${-daysLeft}天，数量${item.quantity}，追溯码${item.trace_code}，处置单：${disposalNo}`,
+            relatedType: 'inventory',
+            relatedId: item.id,
+            operatorRole: 'system',
+            operatorName: '系统效期巡检',
+            oldValue: item.status,
+            newValue: 'scrapped',
+            status: 'scrapped'
+          });
+
           result.details.expired.push(item);
           result.itemsScrapped++;
           result.alertsCreated++;
@@ -114,6 +130,18 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
               'inventory',
               item.id
             );
+
+            logInserts.push({
+              bizType: BizType.EXPIRY_ALERT,
+              action: LogAction.ALERT,
+              title: `7天效期预警（剩余${daysLeft}天）`,
+              detail: `【${item.consumable_name}】批次${item.batch_no}，追溯码${item.trace_code}，数量${item.quantity}，已锁定出库禁止领用`,
+              relatedType: 'inventory',
+              relatedId: item.id,
+              operatorRole: 'system',
+              operatorName: '系统效期巡检',
+              status: 'near_expiry_locked'
+            });
           }
 
           if (!alreadyLocked) {
@@ -151,6 +179,18 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
               'inventory',
               item.id
             );
+
+            logInserts.push({
+              bizType: BizType.EXPIRY_ALERT,
+              action: LogAction.ALERT,
+              title: `30天效期预警（剩余${daysLeft}天）`,
+              detail: `【${item.consumable_name}】批次${item.batch_no}，追溯码${item.trace_code}，数量${item.quantity}，已锁定出库禁止领用`,
+              relatedType: 'inventory',
+              relatedId: item.id,
+              operatorRole: 'system',
+              operatorName: '系统效期巡检',
+              status: 'near_expiry_locked'
+            });
           }
 
           if (!alreadyLocked) {
@@ -176,6 +216,22 @@ export function checkAndHandleExpiry(): ExpiryCheckResult {
   });
 
   tx();
+
+  for (const log of logInserts) {
+    logOperation(log);
+  }
+
+  if (result.alertsCreated > 0 || result.itemsLocked > 0 || result.itemsScrapped > 0) {
+    logOperation({
+      bizType: BizType.EXPIRY_ALERT,
+      action: LogAction.INVENTORY_CHECK,
+      title: '效期巡检任务完成',
+      detail: `本次巡检：创建预警${result.alertsCreated}条，锁定临期${result.itemsLocked}项，自动报废${result.itemsScrapped}项（30天预警${result.details.alert30.length}项/7天预警${result.details.alert7.length}项/过期${result.details.expired.length}项）`,
+      operatorRole: 'system',
+      operatorName: '系统效期巡检',
+      status: 'completed'
+    });
+  }
 
   return result;
 }
